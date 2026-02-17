@@ -1,0 +1,123 @@
+{
+  "enabled": {
+    "description": "插件总开关",
+    "type": "bool",
+    "hint": "关闭时不连接 IMAP，仅保持后台任务空转。如果想停用该插件请在webui界面禁用，而不是在此处关闭。",
+    "default": false
+  },
+  "imap_host": {
+    "description": "IMAP 服务器地址",
+    "type": "string",
+    "hint": "例如 imap.gmail.com",
+    "default": ""
+  },
+  "imap_port": {
+    "description": "IMAP 端口",
+    "type": "int",
+    "hint": "通常为 993 (SSL)",
+    "default": 993
+  },
+  "imap_use_ssl": {
+    "description": "是否启用 SSL",
+    "type": "bool",
+    "hint": "绝大多数邮箱服务应保持开启",
+    "default": true
+  },
+  "imap_username": {
+    "description": "邮箱账号",
+    "type": "string",
+    "hint": "用于登录 IMAP",
+    "default": ""
+  },
+  "imap_password": {
+    "description": "邮箱授权码",
+    "type": "string",
+    "hint": "请使用应用专用密码/授权码，不要使用主密码",
+    "default": ""
+  },
+  "imap_mailbox": {
+    "description": "邮箱文件夹",
+    "type": "string",
+    "hint": "默认 INBOX",
+    "default": "INBOX"
+  },
+  "poll_interval_sec": {
+    "description": "轮询频率（秒）",
+    "type": "int",
+    "hint": "每隔多少秒检查一次邮箱",
+    "default": 60
+  },
+  "sender_allowlist": {
+    "description": "允许的发件人列表",
+    "type": "list",
+    "hint": "仅处理列表中的发件人地址（小写匹配）",
+    "default": []
+  },
+  "target_sessions": {
+    "description": "推送目标会话列表",
+    "type": "list",
+    "hint": "统一会话 ID，例如 napcat:GroupMessage:123456",
+    "default": []
+  },
+  "alert_window_hours": {
+    "description": "告警有效期（小时）",
+    "type": "int",
+    "hint": "仅处理该时间窗口内的邮件",
+    "default": 24
+  },
+  "max_body_chars": {
+    "description": "送入 LLM 的正文最大字符数",
+    "type": "int",
+    "hint": "正文过长时会截断",
+    "default": 2000
+  },
+  "max_summary_chars": {
+    "description": "摘要最大字符数",
+    "type": "int",
+    "hint": "用于限制 AI 输出摘要长度",
+    "default": 100
+  },
+  "fetch_batch_size": {
+    "description": "每轮处理邮件上限",
+    "type": "int",
+    "hint": "单次轮询最多处理多少封邮件",
+    "default": 20
+  },
+  "bootstrap_mode": {
+    "description": "首次部署策略",
+    "type": "string",
+    "options": ["silent_index", "normal", "latest_one"],
+    "hint": "silent_index: 只建索引不推送；normal: 正常推送；latest_one: 仅推送最新一条",
+    "default": "silent_index"
+  },
+  "llm_prompt_template": {
+    "description": "自定义 LLM Prompt",
+    "type": "text",
+    "hint": "留空则使用内置模板，可使用 {subject} {body} {sender} {mail_date_utc} {max_summary_chars} 变量",
+    "default": ""
+  },
+  "llm_retry_limit": {
+    "description": "LLM 失败重试次数",
+    "type": "int",
+    "hint": "单封邮件 LLM 判定失败时的最大重试次数",
+    "default": 3
+  },
+  "network_retry_base_sec": {
+    "description": "网络重试初始间隔（秒）",
+    "type": "int",
+    "hint": "IMAP 异常后的指数退避起点",
+    "default": 5
+  },
+  "network_retry_max_sec": {
+    "description": "网络重试最大间隔（秒）",
+    "type": "int",
+    "hint": "指数退避上限",
+    "default": 300
+  },
+  "debug_log": {
+    "description": "调试日志开关",
+    "type": "bool",
+    "hint": "开启后会打印 LLM 原始响应截断内容",
+    "default": false
+  }
+}
