@@ -130,8 +130,8 @@
   "test_sender": {
     "description": "测试邮件发件人",
     "type": "string",
-    "hint": "用于 /campusalert test 的模拟发件人，如 no-reply@alertable.ca",
-    "default": "no-reply@alertable.ca"
+    "hint": "用于 /campusalert test 的模拟发件人",
+    "default": ""
   },
   "test_subject": {
     "description": "测试邮件主题",
@@ -143,7 +143,7 @@
     "description": "测试邮件正文",
     "type": "text",
     "hint": "用于 /campusalert test 的模拟正文，会按 max_body_chars 截断",
-    "default": "这是一封用于 CampusAlert 插件联调的测试邮件。请模拟校园安全告警流程并进行判定。"
+    "default": ""
   },
   "debug_log": {
     "description": "调试日志开关",
