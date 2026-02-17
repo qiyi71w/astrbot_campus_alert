@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import imaplib
+import inspect
 import re
 from collections.abc import Iterable
+from urllib.parse import unquote, urlparse
+
+from astrbot.api import logger
 
 
 try:
@@ -38,7 +43,12 @@ def _extract_uid_marker_from_text(text: str) -> str | None:
     if "UID" not in upper:
         return None
     # Metadata lines usually contain FETCH or start with "*".
-    if "FETCH" not in upper and not upper.lstrip().startswith("*"):
+    compact = upper.lstrip()
+    if (
+        "FETCH" not in upper
+        and not compact.startswith("*")
+        and not re.match(r"^\d+\s+\(", compact)
+    ):
         return None
     match = re.search(r"\bUID\s+(\d+)\b", text, re.IGNORECASE)
     if not match:
@@ -55,6 +65,25 @@ def _pick_best_email_chunk(chunks: list[bytes]) -> bytes | None:
     return max(chunks, key=len)
 
 
+def _normalize_mailbox_name(mailbox: str | None) -> str:
+    raw = (mailbox or "INBOX").strip()
+    if not raw:
+        return "INBOX"
+
+    lower = raw.lower()
+    if lower.startswith("imap://") or lower.startswith("imaps://"):
+        parsed = urlparse(raw)
+        path = unquote(parsed.path or "").strip()
+        if not path:
+            return "INBOX"
+        path = path.strip("/")
+        if not path:
+            return "INBOX"
+        return path.split("/")[-1] or "INBOX"
+
+    return raw
+
+
 class AsyncImapClient:
     """Small compatibility wrapper around aioimaplib."""
 
@@ -64,10 +93,35 @@ class AsyncImapClient:
         self.use_ssl = bool(use_ssl)
         self.timeout = max(5, int(timeout))
         self._client = None
+        self._sync_client: imaplib.IMAP4 | None = None
         self._mailbox = "INBOX"
         self._connected = False
+        self._id_available_methods: list[str] = []
+        self._active_fetch_mode = ""
 
     async def connect(self, username: str, password: str, mailbox: str = "INBOX") -> None:
+        self._mailbox = _normalize_mailbox_name(mailbox)
+
+        if self._should_prefer_std_imap():
+            logger.info(
+                "[CampusAlert] 检测到网易系 IMAP 主机，优先尝试 stdlib 连接。host=%s",
+                self.host,
+            )
+            fallback_ok, fallback_note = await self._try_connect_with_std_imap(
+                username=username,
+                password=password,
+                mailbox=self._mailbox,
+            )
+            if fallback_ok:
+                self._connected = True
+                self._active_fetch_mode = "stdlib-fallback"
+                logger.info("[CampusAlert] IMAP stdlib 优先连接成功。%s", fallback_note)
+                return
+            logger.warning(
+                "[CampusAlert] IMAP stdlib 优先连接失败，回退 aioimaplib。%s",
+                fallback_note,
+            )
+
         if aioimaplib is None:
             raise ImapClientError(
                 "aioimaplib is not installed. Please install plugin requirements.",
@@ -87,32 +141,97 @@ class AsyncImapClient:
             )
 
         await self._client.wait_hello_from_server()
+
+        # Some providers (notably NetEase family) may require ID handshake.
+        self._id_available_methods = self._collect_id_method_names()
+        id_sent_before_login = await self._send_client_id_if_supported(contact=username)
+
         status, _ = self._normalize_response(await self._client.login(username, password))
         if not self._is_ok(status):
             raise ImapClientError(f"IMAP login failed: {status}")
 
-        self._mailbox = mailbox or "INBOX"
-        status, _ = self._normalize_response(await self._client.select(self._mailbox))
-        if not self._is_ok(status):
-            raise ImapClientError(f"IMAP select mailbox failed: {status}")
+        # Retry ID in authenticated state for clients/servers that expect it here.
+        id_sent_after_login = await self._send_client_id_if_supported(contact=username)
+        logger.info(
+            "[CampusAlert] IMAP ID 握手结果 pre=%s post=%s methods=%s",
+            id_sent_before_login,
+            id_sent_after_login,
+            ",".join(self._id_available_methods) or "-",
+        )
+
+        selected_mailbox, select_status, select_lines = await self._select_mailbox_with_fallback(
+            self._mailbox,
+        )
+        if not selected_mailbox:
+            detail = self._format_lines_excerpt(select_lines)
+            unsafe_login = "UNSAFE LOGIN" in detail.upper()
+            fallback_note = "-"
+            if unsafe_login:
+                logger.warning(
+                    "[CampusAlert] IMAP SELECT 命中 Unsafe Login，尝试 stdlib 回退。mailbox=%s detail=%s",
+                    self._mailbox,
+                    detail,
+                )
+                fallback_ok, fallback_note = await self._try_connect_with_std_imap(
+                    username=username,
+                    password=password,
+                    mailbox=self._mailbox,
+                )
+                if fallback_ok:
+                    self._connected = True
+                    self._active_fetch_mode = "stdlib-fallback"
+                    logger.info("[CampusAlert] IMAP stdlib 回退连接成功。%s", fallback_note)
+                    return
+                logger.warning("[CampusAlert] IMAP stdlib 回退失败。%s", fallback_note)
+            raise ImapClientError(
+                "IMAP select mailbox failed: "
+                f"{select_status}; mailbox={self._mailbox}; "
+                f"id_pre={id_sent_before_login}; id_post={id_sent_after_login}; "
+                f"id_methods={','.join(self._id_available_methods) or '-'}; "
+                f"detail={detail}; std_imap_fallback={fallback_note}",
+            )
+        self._mailbox = selected_mailbox
 
         self._connected = True
+        self._active_fetch_mode = "aioimaplib"
+        logger.info("[CampusAlert] IMAP 原生连接成功。mailbox=%s", self._mailbox)
 
     async def close(self) -> None:
-        if not self._client:
-            return
-        try:
-            if hasattr(self._client, "logout"):
-                await self._client.logout()
-        except Exception:
-            pass
-        finally:
-            self._connected = False
-            self._client = None
+        if self._sync_client:
+            sync_client = self._sync_client
+            self._sync_client = None
+            try:
+                await asyncio.to_thread(sync_client.logout)
+            except Exception:
+                pass
+
+        if self._client:
+            try:
+                if hasattr(self._client, "logout"):
+                    await self._client.logout()
+            except Exception:
+                pass
+            finally:
+                self._client = None
+
+        self._connected = False
+        self._active_fetch_mode = ""
 
     async def fetch_latest_emails(self, batch_size: int) -> list[tuple[str, bytes]]:
-        if not self._connected or not self._client:
+        if not self._connected:
             raise ImapClientError("IMAP client is not connected")
+
+        if self._sync_client is not None:
+            if self._active_fetch_mode != "stdlib-fallback":
+                self._active_fetch_mode = "stdlib-fallback"
+                logger.info("[CampusAlert] 当前邮件拉取路径：stdlib 回退链路")
+            return await self._fetch_latest_emails_sync(batch_size)
+
+        if not self._client:
+            raise ImapClientError("IMAP client is not connected")
+        if self._active_fetch_mode != "aioimaplib":
+            self._active_fetch_mode = "aioimaplib"
+            logger.info("[CampusAlert] 当前邮件拉取路径：aioimaplib 原生链路")
 
         uids = await self._search_uids("ALL")
         if not uids:
@@ -133,6 +252,24 @@ class AsyncImapClient:
                 emails.append((uid, bulk_map[uid]))
                 continue
             raw = await self._fetch_email_by_uid(uid)
+            if raw:
+                emails.append((uid, raw))
+        return emails
+
+    async def _fetch_latest_emails_sync(self, batch_size: int) -> list[tuple[str, bytes]]:
+        uids = await self._search_uids_sync("ALL")
+        if not uids:
+            return []
+
+        selected_uids = uids[-max(1, int(batch_size)) :]
+        uid_set = self._build_uid_set(selected_uids)
+        bulk_map = await self._fetch_raw_emails_by_uid_set_sync(uid_set)
+
+        emails: list[tuple[str, bytes]] = []
+        for uid in selected_uids:
+            raw = bulk_map.get(uid)
+            if raw is None:
+                raw = await self._fetch_email_by_uid_sync(uid)
             if raw:
                 emails.append((uid, raw))
         return emails
@@ -258,6 +395,119 @@ class AsyncImapClient:
                     return raw
 
         raise ImapClientError(f"Unable to fetch email content by UID {uid}")
+
+    async def _search_uids_sync(self, criteria: str) -> list[str]:
+        for args in ((None, criteria), (criteria,)):
+            status, lines = await self._sync_uid_command("SEARCH", *args)
+            if status == "OK":
+                return self._parse_uids(lines)
+        raise ImapClientError("IMAP UID SEARCH failed in sync fallback mode")
+
+    async def _fetch_raw_emails_by_uid_set_sync(self, uid_set: str) -> dict[str, bytes]:
+        if not uid_set:
+            return {}
+        status, lines = await self._sync_uid_command("FETCH", uid_set, "(RFC822)")
+        if status != "OK":
+            return {}
+        return self._extract_raw_emails(lines)
+
+    async def _fetch_email_by_uid_sync(self, uid: str) -> bytes:
+        status, lines = await self._sync_uid_command("FETCH", uid, "(RFC822)")
+        if status != "OK":
+            return b""
+        return self._extract_raw_email(lines) or b""
+
+    async def _sync_uid_command(self, command: str, *args) -> tuple[str, list]:
+        if not self._sync_client:
+            raise ImapClientError("sync IMAP client is not connected")
+
+        def _run():
+            return self._sync_client.uid(command, *args)
+
+        typ, data = await asyncio.to_thread(_run)
+        status = _ensure_text(typ).upper()
+        if data is None:
+            lines = []
+        elif isinstance(data, list):
+            lines = data
+        else:
+            lines = [data]
+        return status, lines
+
+    async def _try_connect_with_std_imap(
+        self,
+        *,
+        username: str,
+        password: str,
+        mailbox: str,
+    ) -> tuple[bool, str]:
+        if self.use_ssl:
+            client_cls = imaplib.IMAP4_SSL
+        else:
+            client_cls = imaplib.IMAP4
+
+        client: imaplib.IMAP4 | None = None
+        try:
+            client = await asyncio.to_thread(client_cls, self.host, self.port)
+            typ, _ = await asyncio.to_thread(client.login, username, password)
+            if _ensure_text(typ).upper() != "OK":
+                await asyncio.to_thread(client.logout)
+                return False, f"sync_login={typ}"
+
+            id_ok = await asyncio.to_thread(
+                self._send_id_with_std_imap,
+                client,
+                username,
+            )
+
+            selected = ""
+            last_typ = ""
+            last_data = []
+            for candidate in self._build_mailbox_candidates(mailbox):
+                typ, data = await asyncio.to_thread(client.select, candidate)
+                last_typ = _ensure_text(typ).upper()
+                last_data = data if isinstance(data, list) else [data]
+                if last_typ == "OK":
+                    selected = candidate
+                    break
+
+            if not selected:
+                await asyncio.to_thread(client.logout)
+                detail = self._format_lines_excerpt(last_data)
+                return False, f"sync_select={last_typ}; detail={detail}; id={id_ok}"
+
+            # hand over ownership to async wrapper
+            self._sync_client = client
+            self._mailbox = selected
+            self._client = None
+            return True, f"id={id_ok}; mailbox={selected}"
+        except Exception as exc:
+            if client is not None:
+                try:
+                    await asyncio.to_thread(client.logout)
+                except Exception:
+                    pass
+            return False, f"sync_exception={type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _send_id_with_std_imap(client: imaplib.IMAP4, contact: str) -> bool:
+        payload = (
+            f'("name" "Thunderbird" "version" "115.0" '
+            f'"vendor" "Mozilla" "contact" "{contact or "unknown"}")'
+        )
+        try:
+            typ, _ = client.xatom("ID", payload)
+            if _ensure_text(typ).upper() == "OK":
+                return True
+        except Exception:
+            pass
+
+        try:
+            tag = client._simple_command("ID", payload)  # type: ignore[attr-defined]
+            typ, _ = client._command_complete("ID", tag)  # type: ignore[attr-defined]
+            return _ensure_text(typ).upper() == "OK"
+        except Exception:
+            return False
 
     @staticmethod
     def _build_uid_set(uids: list[str]) -> str:
@@ -417,6 +667,119 @@ class AsyncImapClient:
         # Fall back to the longest binary chunk.
         return max(candidates, key=len)
 
-    async def wait_before_retry(self, seconds: float) -> None:
-        await asyncio.sleep(max(0.0, float(seconds)))
+    async def _send_client_id_if_supported(self, *, contact: str = "") -> bool:
+        if not self._client:
+            return False
 
+        contact_value = (contact or "unknown").strip() or "unknown"
+        id_pairs = [
+            ("name", "Thunderbird"),
+            ("version", "115.0"),
+            ("vendor", "Mozilla"),
+            ("contact", contact_value),
+        ]
+        payload = "(" + " ".join(f'"{k}" "{v}"' for k, v in id_pairs) + ")"
+        pair_dict = dict(id_pairs)
+
+        async def _attempt(method, *args, **kwargs) -> bool:
+            try:
+                response = method(*args, **kwargs)
+                if inspect.isawaitable(response):
+                    response = await response
+            except Exception:
+                return False
+            status, _ = self._normalize_response(response)
+            return self._is_ok(status)
+
+        def _get_callable(name: str):
+            method = getattr(self._client, name, None)
+            if callable(method):
+                return method
+            return None
+
+        # Keep only proven paths:
+        # 1) Native id()/ID() API if present.
+        for name in ("id", "ID"):
+            method = _get_callable(name)
+            if not method:
+                continue
+            if await _attempt(method, pair_dict):
+                return True
+            if await _attempt(method, payload):
+                return True
+
+        # 2) Command-style fallback.
+        for name in ("simple_command", "_simple_command", "xatom"):
+            method = _get_callable(name)
+            if not method:
+                continue
+            if await _attempt(method, "ID", payload):
+                return True
+        return False
+
+    def _collect_id_method_names(self) -> list[str]:
+        if not self._client:
+            return []
+        candidates = [
+            "id",
+            "ID",
+            "simple_command",
+            "_simple_command",
+            "xatom",
+        ]
+        available = []
+        for name in candidates:
+            method = getattr(self._client, name, None)
+            if callable(method):
+                available.append(name)
+        return available
+
+    async def _select_mailbox_with_fallback(self, mailbox: str) -> tuple[str, str, list]:
+        candidates = self._build_mailbox_candidates(mailbox)
+        last_status = ""
+        last_lines: list = []
+        for candidate in candidates:
+            status, lines = self._normalize_response(await self._client.select(candidate))
+            last_status = status
+            last_lines = lines
+            if self._is_ok(status):
+                return candidate, status, lines
+        return "", last_status, last_lines
+
+    @staticmethod
+    def _build_mailbox_candidates(mailbox: str) -> list[str]:
+        base = _normalize_mailbox_name(mailbox)
+        candidates = [base]
+        unquoted = base.strip('"').strip("'").strip()
+        if unquoted and unquoted != base:
+            candidates.append(unquoted)
+        if unquoted and " " in unquoted:
+            candidates.append(f'"{unquoted}"')
+        if unquoted.upper() == "INBOX":
+            candidates.extend(["INBOX", "Inbox", "inbox"])
+
+        # Keep order and remove duplicates.
+        deduped: list[str] = []
+        seen = set()
+        for item in candidates:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _should_prefer_std_imap(self) -> bool:
+        host = (self.host or "").strip().lower()
+        return host in {"imap.163.com", "imap.126.com", "imap.yeah.net"}
+
+    @staticmethod
+    def _format_lines_excerpt(lines: list, max_parts: int = 3) -> str:
+        parts: list[str] = []
+        for line in _flatten_lines(lines):
+            text = _ensure_text(line).strip()
+            if not text:
+                continue
+            parts.append(text)
+            if len(parts) >= max_parts:
+                break
+        return " | ".join(parts) if parts else "-"
