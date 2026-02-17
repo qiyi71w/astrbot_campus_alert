@@ -166,6 +166,7 @@ class CampusAlertPlugin(Star):
 
         self._stop_event = asyncio.Event()
         self._wake_event = asyncio.Event()
+        self._poll_lock = asyncio.Lock()
         self._monitor_task: asyncio.Task | None = None
         self._reload_requested = False
         self._bootstrap_pending = False
@@ -185,12 +186,39 @@ class CampusAlertPlugin(Star):
             "push_failed": 0,
         }
 
+    @staticmethod
+    def _state_text(state: str) -> str:
+        mapping = {
+            "starting": "启动中",
+            "idle": "空闲",
+            "disabled": "已停用",
+            "config_error": "配置错误",
+            "running": "运行中",
+            "error": "异常",
+        }
+        return mapping.get(state, state)
+
+    @staticmethod
+    def _format_dt_utc(value: datetime | None) -> str:
+        if value is None:
+            return "暂无"
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _snapshot_stats(self) -> dict[str, int]:
+        return {key: int(value) for key, value in self.stats.items()}
+
+    def _is_command_session_allowed(self, event: AstrMessageEvent) -> bool:
+        current = PluginSettings.from_config(self.config)
+        self.settings = current
+        current_session = event.unified_msg_origin
+        return current_session in set(current.target_sessions)
+
     async def initialize(self):
         self.store.load()
         self._bootstrap_pending = self.store.first_bootstrap
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info(
-            "[CampusAlert] Initialized. first_bootstrap=%s records=%s",
+            "[CampusAlert] 插件已初始化。首次启动=%s，去重记录=%s",
             self._bootstrap_pending,
             self.store.count(),
         )
@@ -206,7 +234,7 @@ class CampusAlertPlugin(Star):
                 pass
         await self._close_imap_client()
         self.store.save(force=True)
-        logger.info("[CampusAlert] Terminated.")
+        logger.info("[CampusAlert] 插件已停止。")
 
     async def _monitor_loop(self):
         await asyncio.sleep(5)
@@ -215,7 +243,8 @@ class CampusAlertPlugin(Star):
             self.settings = PluginSettings.from_config(self.config)
 
             if self._reload_requested:
-                await self._close_imap_client()
+                async with self._poll_lock:
+                    await self._close_imap_client()
                 self._reload_requested = False
 
             if not self.settings.enabled:
@@ -230,8 +259,9 @@ class CampusAlertPlugin(Star):
                 continue
 
             try:
-                await self._ensure_imap_client()
-                fetched_count = await self._poll_once()
+                async with self._poll_lock:
+                    await self._ensure_imap_client()
+                    fetched_count = await self._poll_once()
                 self.stats["cycles"] += 1
                 self.stats["fetched"] += fetched_count
                 self.last_poll_at = datetime.now(timezone.utc)
@@ -245,7 +275,8 @@ class CampusAlertPlugin(Star):
                 self.runtime_state = "error"
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.error("[CampusAlert] Monitor loop error: %s", self.last_error)
-                await self._close_imap_client()
+                async with self._poll_lock:
+                    await self._close_imap_client()
                 wait_seconds = (
                     self.backoff_seconds
                     if self.backoff_seconds > 0
@@ -294,7 +325,7 @@ class CampusAlertPlugin(Star):
         )
         self.imap_signature = signature
         logger.info(
-            "[CampusAlert] IMAP connected. host=%s mailbox=%s",
+            "[CampusAlert] IMAP 已连接。主机=%s，邮箱文件夹=%s",
             self.settings.imap_host,
             self.settings.imap_mailbox,
         )
@@ -517,23 +548,110 @@ class CampusAlertPlugin(Star):
                 )
         return sent
 
+    async def _run_manual_check(self) -> tuple[bool, str]:
+        self.settings = PluginSettings.from_config(self.config)
+        if not self.settings.enabled:
+            self.runtime_state = "disabled"
+            return True, "立即检查未执行：插件当前处于关闭状态。"
+
+        if not self.settings.has_required_imap():
+            self.runtime_state = "config_error"
+            self.last_error = "IMAP 配置缺少必填项。"
+            return False, "立即检查失败：IMAP 配置缺少必填项。"
+
+        before = self._snapshot_stats()
+        fetched_count = 0
+
+        try:
+            async with self._poll_lock:
+                await self._ensure_imap_client()
+                fetched_count = await self._poll_once()
+        except Exception as exc:
+            self.runtime_state = "error"
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("[CampusAlert] Manual check failed: %s", self.last_error)
+            async with self._poll_lock:
+                await self._close_imap_client()
+            return False, f"立即检查失败：{self.last_error}"
+
+        self.stats["cycles"] += 1
+        self.stats["fetched"] += fetched_count
+        self.last_poll_at = datetime.now(timezone.utc)
+        self.last_error = ""
+        self.runtime_state = "running"
+        self.backoff_seconds = self.settings.network_retry_base_sec
+
+        after = self._snapshot_stats()
+        eligible_delta = max(0, after["eligible"] - before["eligible"])
+        pushed_delta = max(0, after["pushed"] - before["pushed"])
+        ignored_delta = max(0, after["ignored"] - before["ignored"])
+        llm_failed_delta = max(0, after["llm_failed"] - before["llm_failed"])
+        push_failed_delta = max(0, after["push_failed"] - before["push_failed"])
+
+        lines = [
+            "立即检查完成。",
+            f"本轮拉取邮件：{fetched_count} 封",
+            f"符合规则邮件：{eligible_delta} 封",
+            f"告警推送条数：{pushed_delta} 条",
+        ]
+        if pushed_delta > 0:
+            lines.append(f"结果：发现 {pushed_delta} 条告警并已尝试推送。")
+        else:
+            lines.append("结果：未发现需要推送的告警。")
+        if ignored_delta > 0:
+            lines.append(f"忽略邮件：{ignored_delta} 封")
+        if llm_failed_delta > 0:
+            lines.append(f"LLM 失败：{llm_failed_delta} 封")
+        if push_failed_delta > 0:
+            lines.append(f"推送失败：{push_failed_delta} 次")
+        return True, "\n".join(lines)
+
+    async def _reload_now(self) -> tuple[bool, str]:
+        self.settings = PluginSettings.from_config(self.config)
+        try:
+            async with self._poll_lock:
+                await self._close_imap_client()
+                if self.settings.enabled and self.settings.has_required_imap():
+                    await self._ensure_imap_client()
+        except Exception as exc:
+            self.runtime_state = "error"
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("[CampusAlert] reload failed: %s", self.last_error)
+            return False, f"重载失败：{self.last_error}"
+
+        if not self.settings.enabled:
+            self.runtime_state = "disabled"
+            self.last_error = ""
+            message = "重载成功：配置已加载，插件当前处于关闭状态。"
+        elif not self.settings.has_required_imap():
+            self.runtime_state = "config_error"
+            self.last_error = "IMAP 配置缺少必填项。"
+            message = "重载成功：配置已加载，但 IMAP 必填项不完整。"
+        else:
+            self.runtime_state = "idle"
+            self.last_error = ""
+            message = "重载成功：配置已加载并重建 IMAP 连接。"
+
+        logger.info("[CampusAlert] %s", message)
+        return True, message
+
     def _build_status_text(self) -> str:
-        last_poll = self.last_poll_at.isoformat() if self.last_poll_at else "N/A"
+        last_poll = self._format_dt_utc(self.last_poll_at)
         return (
-            "Campus Alert 状态\n"
-            f"state: {self.runtime_state}\n"
-            f"enabled: {self.settings.enabled}\n"
-            f"last_poll_utc: {last_poll}\n"
-            f"records: {self.store.count()}\n"
-            f"cycles: {self.stats['cycles']}\n"
-            f"fetched: {self.stats['fetched']}\n"
-            f"eligible: {self.stats['eligible']}\n"
-            f"pushed: {self.stats['pushed']}\n"
-            f"ignored: {self.stats['ignored']}\n"
-            f"bootstrap_indexed: {self.stats['bootstrap_indexed']}\n"
-            f"llm_failed: {self.stats['llm_failed']}\n"
-            f"push_failed: {self.stats['push_failed']}\n"
-            f"last_error: {self.last_error or 'None'}"
+            "校园告警插件状态\n"
+            f"运行状态：{self._state_text(self.runtime_state)}\n"
+            f"插件开关：{'开启' if self.settings.enabled else '关闭'}\n"
+            f"最近轮询时间：{last_poll}\n"
+            f"去重记录数：{self.store.count()}\n"
+            f"轮询次数：{self.stats['cycles']}\n"
+            f"拉取邮件总数：{self.stats['fetched']}\n"
+            f"符合规则总数：{self.stats['eligible']}\n"
+            f"已推送告警：{self.stats['pushed']}\n"
+            f"已忽略邮件：{self.stats['ignored']}\n"
+            f"启动静默索引：{self.stats['bootstrap_indexed']}\n"
+            f"LLM 失败次数：{self.stats['llm_failed']}\n"
+            f"推送失败次数：{self.stats['push_failed']}\n"
+            f"最近错误：{self.last_error or '无'}"
         )
 
     @filter.command("campusalert")
@@ -549,22 +667,27 @@ class CampusAlertPlugin(Star):
                     subcommand = tokens[idx + 1].strip().lower()
                 break
 
+        if not self._is_command_session_allowed(event):
+            logger.info(
+                "[CampusAlert] 忽略未授权会话的指令请求，会话=%s",
+                event.unified_msg_origin,
+            )
+            return
+
         if subcommand == "status":
             yield event.plain_result(self._build_status_text())
             return
 
         if subcommand == "checknow":
-            self._wake_event.set()
-            yield event.plain_result("已触发立即检查。")
+            _, message = await self._run_manual_check()
+            yield event.plain_result(message)
             return
 
         if subcommand == "reload":
-            self._reload_requested = True
-            self._wake_event.set()
-            yield event.plain_result("已请求重载配置并重建连接。")
+            _, message = await self._reload_now()
+            yield event.plain_result(message)
             return
 
         yield event.plain_result(
             "用法: /campusalert status | /campusalert checknow | /campusalert reload",
         )
-

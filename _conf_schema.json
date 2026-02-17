@@ -8,7 +8,7 @@
   "imap_host": {
     "description": "IMAP 服务器地址",
     "type": "string",
-    "hint": "例如 imap.gmail.com",
+    "hint": "例如 imap.163.com",
     "default": ""
   },
   "imap_port": {
