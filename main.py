@@ -505,7 +505,12 @@ class CampusAlertPlugin(Star):
         self.store.save()
         return unique_fetched_count
 
-    async def _classify_with_retry(self, parsed_mail) -> tuple[AlertDecision | None, int]:
+    async def _classify_with_retry(
+        self,
+        parsed_mail,
+        *,
+        mutate_runtime_state: bool = True,
+    ) -> tuple[AlertDecision | None, int]:
         last_error = ""
         for attempt in range(1, self.settings.llm_retry_limit + 1):
             try:
@@ -525,8 +530,9 @@ class CampusAlertPlugin(Star):
             if attempt < self.settings.llm_retry_limit:
                 await asyncio.sleep(min(1.5 * attempt, 5))
 
-        self.stats["llm_failed"] += 1
-        self.last_error = last_error or "LLM classification failed."
+        if mutate_runtime_state:
+            self.stats["llm_failed"] += 1
+            self.last_error = last_error or "LLM classification failed."
         return None, self.settings.llm_retry_limit
 
     async def _push_alert(
@@ -623,7 +629,10 @@ class CampusAlertPlugin(Star):
                 body_text=body[: self.settings.max_body_chars],
             )
 
-            decision, _ = await self._classify_with_retry(parsed_mail)
+            decision, _ = await self._classify_with_retry(
+                parsed_mail,
+                mutate_runtime_state=False,
+            )
             if decision is None:
                 return False, "测试失败：LLM 判定失败（返回格式无效或重试耗尽）。"
 

@@ -217,6 +217,17 @@ class AsyncImapClient:
         self._connected = False
         self._active_fetch_mode = ""
 
+    async def _close_async_client_only(self) -> None:
+        if not self._client:
+            return
+        client = self._client
+        self._client = None
+        try:
+            if hasattr(client, "logout"):
+                await client.logout()
+        except Exception as exc:
+            logger.debug("[CampusAlert] 清理 aioimaplib 连接失败（忽略）：%s", exc)
+
     async def fetch_latest_emails(self, batch_size: int) -> list[tuple[str, bytes]]:
         if not self._connected:
             raise ImapClientError("IMAP client is not connected")
@@ -476,6 +487,9 @@ class AsyncImapClient:
                 detail = self._format_lines_excerpt(last_data)
                 return False, f"sync_select={last_typ}; detail={detail}; id={id_ok}"
 
+            # If this call is used as fallback after aioimaplib already connected,
+            # release that connection before switching to stdlib path.
+            await self._close_async_client_only()
             # hand over ownership to async wrapper
             self._sync_client = client
             self._mailbox = selected
