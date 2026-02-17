@@ -1,6 +1,6 @@
 name: astrbot_plugin_campus_alert
 display_name: Campus Alert
 desc: 监控校园告警邮箱并自动推送高优先级通知。
-version: v1.0.0
+version: v1.1.0
 author: qiyi71w
 repo: https://github.com/qiyi71w/astrbot_campus_alert

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parseaddr
 from typing import Any
 
 from astrbot.api import logger
@@ -13,6 +14,7 @@ from astrbot.api.star import Context, Star, StarTools
 from .services.alert_classifier import AlertClassifier, AlertDecision
 from .services.imap_client import AsyncImapClient, ImapClientError
 from .services.mail_parser import (
+    ParsedMail,
     build_fallback_message_key,
     in_alert_window,
     parse_mail,
@@ -86,15 +88,20 @@ class PluginSettings:
     poll_interval_sec: int
     sender_allowlist: set[str]
     target_sessions: list[str]
+    command_admin_only: bool
     alert_window_hours: int
     max_body_chars: int
     max_summary_chars: int
     fetch_batch_size: int
     bootstrap_mode: str
+    llm_provider_id: str
     llm_prompt_template: str
     llm_retry_limit: int
     network_retry_base_sec: int
     network_retry_max_sec: int
+    test_sender: str
+    test_subject: str
+    test_body: str
     debug_log: bool
 
     @classmethod
@@ -121,11 +128,13 @@ class PluginSettings:
             poll_interval_sec=_to_int(source.get("poll_interval_sec"), 60, 5, 3600),
             sender_allowlist=sender_allowlist,
             target_sessions=_to_str_list(source.get("target_sessions")),
+            command_admin_only=_to_bool(source.get("command_admin_only"), True),
             alert_window_hours=_to_int(source.get("alert_window_hours"), 24, 1, 168),
             max_body_chars=_to_int(source.get("max_body_chars"), 2000, 100, 10000),
             max_summary_chars=_to_int(source.get("max_summary_chars"), 100, 10, 300),
             fetch_batch_size=_to_int(source.get("fetch_batch_size"), 20, 1, 100),
             bootstrap_mode=bootstrap_mode,
+            llm_provider_id=_to_str(source.get("llm_provider_id")),
             llm_prompt_template=_to_str(
                 source.get("llm_prompt_template"),
                 DEFAULT_PROMPT_TEMPLATE,
@@ -142,6 +151,19 @@ class PluginSettings:
                 300,
                 5,
                 3600,
+            ),
+            test_sender=_to_str(
+                source.get("test_sender"),
+                "no-reply@alertable.ca",
+            ),
+            test_subject=_to_str(
+                source.get("test_subject"),
+                "[TEST] CampusAlert 模拟告警邮件",
+            ),
+            test_body=_to_str(
+                source.get("test_body"),
+                "这是一封用于 CampusAlert 插件联调的测试邮件。"
+                "请模拟校园安全告警流程并进行判定。",
             ),
             debug_log=_to_bool(source.get("debug_log"), False),
         )
@@ -210,10 +232,6 @@ class CampusAlertPlugin(Star):
     def _refresh_settings(self) -> PluginSettings:
         self.settings = PluginSettings.from_config(self.config)
         return self.settings
-
-    @staticmethod
-    def _is_command_session_allowed(session: str, settings: PluginSettings) -> bool:
-        return session in set(settings.target_sessions)
 
     async def initialize(self):
         self.store.load()
@@ -353,6 +371,7 @@ class CampusAlertPlugin(Star):
 
         now_utc = datetime.now(timezone.utc)
         eligible_items = []
+        unique_fetched_count = 0
 
         for uid, raw_mail in mails:
             try:
@@ -365,6 +384,7 @@ class CampusAlertPlugin(Star):
             key = parsed.message_id if parsed.message_id else build_fallback_message_key(parsed)
             if self.store.has(key):
                 continue
+            unique_fetched_count += 1
 
             if parsed.sender_addr not in self.settings.sender_allowlist:
                 self.store.mark(
@@ -417,7 +437,7 @@ class CampusAlertPlugin(Star):
                 self.store.cleanup()
                 self.store.save()
                 self._bootstrap_pending = False
-                return len(mails)
+                return unique_fetched_count
 
             if mode == "latest_one" and len(eligible_items) > 1:
                 for key, parsed in eligible_items[:-1]:
@@ -483,15 +503,21 @@ class CampusAlertPlugin(Star):
 
         self.store.cleanup()
         self.store.save()
-        return len(mails)
+        return unique_fetched_count
 
-    async def _classify_with_retry(self, parsed_mail) -> tuple[AlertDecision | None, int]:
+    async def _classify_with_retry(
+        self,
+        parsed_mail,
+        *,
+        mutate_runtime_state: bool = True,
+    ) -> tuple[AlertDecision | None, int]:
         last_error = ""
         for attempt in range(1, self.settings.llm_retry_limit + 1):
             try:
                 decision = await self.classifier.classify(
                     parsed_mail,
                     max_summary_chars=self.settings.max_summary_chars,
+                    llm_provider_id=self.settings.llm_provider_id,
                     prompt_template=self.settings.llm_prompt_template,
                     debug_log=self.settings.debug_log,
                 )
@@ -504,17 +530,27 @@ class CampusAlertPlugin(Star):
             if attempt < self.settings.llm_retry_limit:
                 await asyncio.sleep(min(1.5 * attempt, 5))
 
-        self.stats["llm_failed"] += 1
-        self.last_error = last_error or "LLM classification failed."
+        if mutate_runtime_state:
+            self.stats["llm_failed"] += 1
+            self.last_error = last_error or "LLM classification failed."
         return None, self.settings.llm_retry_limit
 
-    async def _push_alert(self, parsed_mail, decision: AlertDecision) -> int:
-        if not self.settings.target_sessions:
-            self.last_error = "No target_sessions configured."
-            self.stats["push_failed"] += 1
+    async def _push_alert(
+        self,
+        parsed_mail,
+        decision: AlertDecision,
+        *,
+        target_sessions: list[str] | None = None,
+        title: str = "校园安全警报",
+        count_stats: bool = True,
+    ) -> int:
+        sessions = target_sessions if target_sessions is not None else self.settings.target_sessions
+        if not sessions:
+            self.last_error = "No target sessions configured."
+            if count_stats:
+                self.stats["push_failed"] += 1
             return 0
 
-        title = "校园安全警报"
         category_label = CATEGORY_LABELS.get(decision.category, decision.category)
         mail_time = (
             parsed_mail.mail_datetime_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -533,25 +569,97 @@ class CampusAlertPlugin(Star):
 
         sent = 0
         chain = MessageChain([Plain(message)])
-        for session in self.settings.target_sessions:
+        for session in sessions:
             try:
                 ok = await self.context.send_message(session, chain)
                 if ok:
                     sent += 1
                 else:
-                    self.stats["push_failed"] += 1
+                    if count_stats:
+                        self.stats["push_failed"] += 1
                     logger.warning(
                         "[CampusAlert] send_message returned False. target=%s",
                         session,
                     )
             except Exception as exc:
-                self.stats["push_failed"] += 1
+                if count_stats:
+                    self.stats["push_failed"] += 1
                 logger.error(
                     "[CampusAlert] push failed target=%s error=%s",
                     session,
                     exc,
                 )
         return sent
+
+    async def _run_test_flow(self, trigger_session: str) -> tuple[bool, str]:
+        async with self._poll_lock:
+            self._refresh_settings()
+            now_utc = datetime.now(timezone.utc)
+
+            sender_raw = self.settings.test_sender
+            subject = self.settings.test_subject or "[TEST] CampusAlert 模拟告警邮件"
+            body = self.settings.test_body
+
+            if not sender_raw:
+                return False, "测试失败：请先配置 test_sender。"
+            if not body:
+                return False, "测试失败：请先配置 test_body。"
+            if not trigger_session:
+                return False, "测试失败：当前会话无效，无法执行测试推送。"
+
+            sender_name, sender_addr = parseaddr(sender_raw)
+            sender_addr = sender_addr.strip().lower()
+            if not sender_addr:
+                sender_addr = sender_raw.strip().lower()
+            if "@" not in sender_addr:
+                return False, "测试失败：test_sender 不是有效邮箱地址。"
+
+            sender_display = sender_raw.strip()
+            if not sender_name and sender_addr == sender_display.lower():
+                sender_display = f"CampusAlertTest <{sender_addr}>"
+
+            parsed_mail = ParsedMail(
+                uid=f"test-{int(now_utc.timestamp())}",
+                message_id=f"<campusalert-test-{int(now_utc.timestamp() * 1000)}>",
+                sender=sender_display,
+                sender_addr=sender_addr,
+                subject=subject,
+                raw_date=now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                mail_datetime_utc=now_utc,
+                body_text=body[: self.settings.max_body_chars],
+            )
+
+            decision, _ = await self._classify_with_retry(
+                parsed_mail,
+                mutate_runtime_state=False,
+            )
+            if decision is None:
+                return False, "测试失败：LLM 判定失败（返回格式无效或重试耗尽）。"
+
+            category_label = CATEGORY_LABELS.get(decision.category, decision.category)
+            if not decision.is_alert:
+                return True, (
+                    "测试完成：LLM 判定不推送。\n"
+                    f"分类：{category_label}\n"
+                    f"置信度：{decision.confidence:.2f}\n"
+                    f"摘要：{decision.summary or '(空)'}"
+                )
+
+            pushed = await self._push_alert(
+                parsed_mail,
+                decision,
+                target_sessions=[trigger_session],
+                title="校园安全警报[TEST]",
+                count_stats=False,
+            )
+            if pushed > 0:
+                return True, (
+                    "测试完成：LLM 判定需要推送，已推送到当前会话。\n"
+                    f"分类：{category_label}\n"
+                    f"置信度：{decision.confidence:.2f}\n"
+                    f"摘要：{decision.summary}"
+                )
+            return False, "测试失败：LLM 判定需要推送，但发送到当前会话失败。"
 
     async def _run_manual_check(self) -> tuple[bool, str]:
         try:
@@ -592,7 +700,7 @@ class CampusAlertPlugin(Star):
 
         lines = [
             "立即检查完成。",
-            f"本轮拉取邮件：{fetched_count} 封",
+            f"本轮新增邮件（去重后）：{fetched_count} 封",
             f"符合规则邮件：{eligible_delta} 封",
             f"告警推送条数：{pushed_delta} 条",
         ]
@@ -668,7 +776,7 @@ class CampusAlertPlugin(Star):
 
     @filter.command("campusalert")
     async def campusalert_command(self, event: AstrMessageEvent):
-        """校园告警插件运维指令: /campusalert status|checknow|reload"""
+        """校园告警插件运维指令: /campusalert status|checknow|reload|test"""
         tokens = [item for item in self.parse_commands(event.message_str).tokens if item]
         subcommand = "status"
         settings = self._refresh_settings()
@@ -680,11 +788,13 @@ class CampusAlertPlugin(Star):
                     subcommand = tokens[idx + 1].strip().lower()
                 break
 
-        if not self._is_command_session_allowed(event.unified_msg_origin, settings):
+        if settings.command_admin_only and not event.is_admin():
             logger.info(
-                "[CampusAlert] 忽略未授权会话的指令请求，会话=%s",
+                "[CampusAlert] 拒绝非管理员指令。发送者=%s，会话=%s",
+                event.get_sender_id(),
                 event.unified_msg_origin,
             )
+            yield event.plain_result("仅 AstrBot 管理员可使用该指令。")
             return
 
         if subcommand == "status":
@@ -701,6 +811,11 @@ class CampusAlertPlugin(Star):
             yield event.plain_result(message)
             return
 
+        if subcommand == "test":
+            _, message = await self._run_test_flow(event.unified_msg_origin)
+            yield event.plain_result(message)
+            return
+
         yield event.plain_result(
-            "用法: /campusalert status | /campusalert checknow | /campusalert reload",
+            "用法: /campusalert status | /campusalert checknow | /campusalert reload | /campusalert test",
         )

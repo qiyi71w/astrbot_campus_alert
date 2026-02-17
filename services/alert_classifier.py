@@ -19,24 +19,33 @@ ALLOWED_CATEGORIES = {
 
 
 DEFAULT_PROMPT_TEMPLATE = (
-    "你是校园预警邮件分类助手。你必须只输出 JSON，不要输出其他文字。\n"
-    "请基于邮件内容判断是否需要推送校园预警通知。\n"
-    "判定标准：\n"
-    "1) security_alert: 人身/财产/治安/暴力/紧急疏散等。\n"
-    "2) class_cancel: 停课、停考、校区关闭、教学活动取消。\n"
-    "3) public_health: 传染病、饮水或食物安全、公共卫生风险。\n"
-    "4) other: 不需要推送。\n\n"
-    "输出 JSON 结构固定为：\n"
-    "{{\"is_alert\": bool, \"category\": \"security_alert|class_cancel|public_health|other\", "
-    "\"summary\": \"string\", \"confidence\": 0.0}}\n"
-    "- summary 必须是中文，包含事件/地点/时间/建议，不超过 {max_summary_chars} 个中文字符。\n"
-    "- 如果 is_alert 为 false，summary 可为空字符串。\n\n"
-    "邮件信息：\n"
-    "From: {sender}\n"
-    "Date(UTC): {mail_date_utc}\n"
-    "Subject: {subject}\n"
-    "Body:\n"
-    "{body}\n"
+"""
+你是校园预警邮件分类助手。你必须只输出 JSON，不要输出其他文字。
+请基于邮件内容判断是否需要推送校园预警通知。
+
+判定标准：
+1) security_alert: 人身/财产/治安/暴力/紧急疏散等。
+2) class_cancel: 停课、停考、校区关闭、教学活动取消。
+3) public_health: 传染病、饮水或食物安全、公共卫生风险。
+4) other: 不需要推送。
+
+输出 JSON 结构固定为：
+{{"is_alert": bool, "category": "security_alert|class_cancel|public_health|other", "summary": "string", "confidence": 0.0}}
+
+summary 撰写严格要求：
+1. 必须包含：[时间+地点+事件]、[关键例外/特殊安排]（如网课是否照常、特定建筑是否开放）、[后续信息获取渠道/更新时间]。
+2. 严禁包含：禁止添加任何邮件原文中未提及的“安全建议”、“温馨提示”或客套话（如“请注意安全”等）。
+3. 语言风格：专业、客观、精炼。
+4. 字数限制：必须使用中文，如果是英文的建筑名称可以维持英文名称不变，不超过 {max_summary_chars} 个中文字符。
+5. 如果 is_alert 为 false，summary 可为空字符串。
+
+邮件信息：
+From: {sender}
+Date(UTC): {mail_date_utc}
+Subject: {subject}
+Body:
+{body}
+"""
 )
 
 
@@ -150,6 +159,7 @@ class AlertClassifier:
         parsed_mail: ParsedMail,
         *,
         max_summary_chars: int,
+        llm_provider_id: str = "",
         prompt_template: str | None = None,
         debug_log: bool = False,
     ) -> AlertDecision | None:
@@ -170,8 +180,28 @@ class AlertClassifier:
         except Exception:
             prompt = DEFAULT_PROMPT_TEMPLATE.format(**format_data)
 
-        provider = self.context.get_using_provider()
-        provider_id = provider.meta().id
+        if debug_log:
+            logger.debug(
+                "[CampusAlert] LLM 输入：from=%s, date_utc=%s, subject=%s, body_chars=%s, prompt_chars=%s",
+                format_data["sender"],
+                format_data["mail_date_utc"],
+                format_data["subject"] or "(无主题)",
+                len(format_data["body"]),
+                len(prompt),
+            )
+            logger.debug(
+                "[CampusAlert] LLM 输入 Prompt(截断): %s",
+                prompt[:1200],
+            )
+
+        provider_id = (llm_provider_id or "").strip()
+        if not provider_id:
+            provider = self.context.get_using_provider()
+            provider_id = provider.meta().id
+
+        if debug_log:
+            logger.debug("[CampusAlert] LLM 使用 Provider ID: %s", provider_id)
+
         llm_response = await self.context.llm_generate(
             chat_provider_id=provider_id,
             prompt=prompt,
@@ -180,10 +210,22 @@ class AlertClassifier:
         raw_text = (llm_response.completion_text or "").strip()
         if debug_log:
             logger.debug(
-                "[CampusAlert] LLM raw response (truncated): %s",
+                "[CampusAlert] LLM 返回原文(截断): %s",
                 raw_text[:800],
             )
-        return self.parse_decision(raw_text, max_summary_chars=max_summary_chars)
+        decision = self.parse_decision(raw_text, max_summary_chars=max_summary_chars)
+        if debug_log:
+            if decision is None:
+                logger.debug("[CampusAlert] LLM 解析结果：无效 JSON 或校验失败")
+            else:
+                logger.debug(
+                    "[CampusAlert] LLM 解析结果：is_alert=%s, category=%s, confidence=%.2f, summary=%s",
+                    decision.is_alert,
+                    decision.category,
+                    decision.confidence,
+                    decision.summary,
+                )
+        return decision
 
     @staticmethod
     def parse_decision(raw_text: str, *, max_summary_chars: int) -> AlertDecision | None:

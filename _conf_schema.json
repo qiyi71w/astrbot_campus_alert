@@ -59,6 +59,12 @@
     "hint": "统一会话 ID，例如 napcat:GroupMessage:123456",
     "default": []
   },
+  "command_admin_only": {
+    "description": "仅管理员可运行指令",
+    "type": "bool",
+    "hint": "开启后仅 AstrBot 管理员可使用 /campusalert 系列指令",
+    "default": true
+  },
   "alert_window_hours": {
     "description": "告警有效期（小时）",
     "type": "int",
@@ -90,6 +96,13 @@
     "hint": "silent_index: 只建索引不推送；normal: 正常推送；latest_one: 仅推送最新一条",
     "default": "silent_index"
   },
+  "llm_provider_id": {
+    "description": "LLM Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可指定用于判定的 Provider，留空则使用当前默认 Provider",
+    "default": ""
+  },
   "llm_prompt_template": {
     "description": "自定义 LLM Prompt",
     "type": "text",
@@ -114,10 +127,28 @@
     "hint": "指数退避上限",
     "default": 300
   },
+  "test_sender": {
+    "description": "测试邮件发件人",
+    "type": "string",
+    "hint": "用于 /campusalert test 的模拟发件人",
+    "default": ""
+  },
+  "test_subject": {
+    "description": "测试邮件主题",
+    "type": "string",
+    "hint": "用于 /campusalert test 的模拟主题",
+    "default": "[TEST] CampusAlert 模拟告警邮件"
+  },
+  "test_body": {
+    "description": "测试邮件正文",
+    "type": "text",
+    "hint": "用于 /campusalert test 的模拟正文，会按 max_body_chars 截断",
+    "default": ""
+  },
   "debug_log": {
     "description": "调试日志开关",
     "type": "bool",
-    "hint": "开启后会打印 LLM 原始响应截断内容",
+    "hint": "开启后会打印 LLM 输入、Prompt 截断、原始返回与解析结果（DEBUG 级别）",
     "default": false
   }
 }
