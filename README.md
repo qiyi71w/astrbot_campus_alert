@@ -18,6 +18,7 @@
 
 ## 运维指令
 
+- 可通过配置项 `command_admin_only` 控制是否仅管理员可用（默认开启）。
 - `/campusalert status`
 - `/campusalert checknow`
 - `/campusalert reload`

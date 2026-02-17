@@ -59,6 +59,12 @@
     "hint": "统一会话 ID，例如 napcat:GroupMessage:123456",
     "default": []
   },
+  "command_admin_only": {
+    "description": "仅管理员可运行指令",
+    "type": "bool",
+    "hint": "开启后仅 AstrBot 管理员可使用 /campusalert 系列指令",
+    "default": true
+  },
   "alert_window_hours": {
     "description": "告警有效期（小时）",
     "type": "int",

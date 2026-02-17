@@ -88,6 +88,7 @@ class PluginSettings:
     poll_interval_sec: int
     sender_allowlist: set[str]
     target_sessions: list[str]
+    command_admin_only: bool
     alert_window_hours: int
     max_body_chars: int
     max_summary_chars: int
@@ -127,6 +128,7 @@ class PluginSettings:
             poll_interval_sec=_to_int(source.get("poll_interval_sec"), 60, 5, 3600),
             sender_allowlist=sender_allowlist,
             target_sessions=_to_str_list(source.get("target_sessions")),
+            command_admin_only=_to_bool(source.get("command_admin_only"), True),
             alert_window_hours=_to_int(source.get("alert_window_hours"), 24, 1, 168),
             max_body_chars=_to_int(source.get("max_body_chars"), 2000, 100, 10000),
             max_summary_chars=_to_int(source.get("max_summary_chars"), 100, 10, 300),
@@ -230,10 +232,6 @@ class CampusAlertPlugin(Star):
     def _refresh_settings(self) -> PluginSettings:
         self.settings = PluginSettings.from_config(self.config)
         return self.settings
-
-    @staticmethod
-    def _is_command_session_allowed(session: str, settings: PluginSettings) -> bool:
-        return session in set(settings.target_sessions)
 
     async def initialize(self):
         self.store.load()
@@ -781,11 +779,13 @@ class CampusAlertPlugin(Star):
                     subcommand = tokens[idx + 1].strip().lower()
                 break
 
-        if not self._is_command_session_allowed(event.unified_msg_origin, settings):
+        if settings.command_admin_only and not event.is_admin():
             logger.info(
-                "[CampusAlert] 忽略未授权会话的指令请求，会话=%s",
+                "[CampusAlert] 拒绝非管理员指令。发送者=%s，会话=%s",
+                event.get_sender_id(),
                 event.unified_msg_origin,
             )
+            yield event.plain_result("仅 AstrBot 管理员可使用该指令。")
             return
 
         if subcommand == "status":
