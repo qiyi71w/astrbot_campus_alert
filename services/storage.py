@@ -110,8 +110,14 @@ class ProcessedEmailStore:
 
         overflow = len(self.records) - self.max_items
         if overflow > 0:
-            keys = list(self.records.keys())[:overflow]
-            for key in keys:
+            sortable: list[tuple[str, datetime]] = []
+            for key, item in self.records.items():
+                processed_at = _parse_iso_datetime(item.get("processed_at"))
+                if processed_at is None:
+                    processed_at = datetime.min.replace(tzinfo=timezone.utc)
+                sortable.append((key, processed_at))
+            sortable.sort(key=lambda item: (item[1], item[0]))
+            for key, _ in sortable[:overflow]:
                 self.records.pop(key, None)
 
         if removable or overflow > 0:
@@ -136,4 +142,3 @@ class ProcessedEmailStore:
 
     def count(self) -> int:
         return len(self.records)
-

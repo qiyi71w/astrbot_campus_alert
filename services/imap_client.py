@@ -33,6 +33,28 @@ def _flatten_lines(lines: Iterable) -> list:
     return result
 
 
+def _extract_uid_marker_from_text(text: str) -> str | None:
+    upper = text.upper()
+    if "UID" not in upper:
+        return None
+    # Metadata lines usually contain FETCH or start with "*".
+    if "FETCH" not in upper and not upper.lstrip().startswith("*"):
+        return None
+    match = re.search(r"\bUID\s+(\d+)\b", text, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _pick_best_email_chunk(chunks: list[bytes]) -> bytes | None:
+    if not chunks:
+        return None
+    for item in chunks:
+        if b"\r\n\r\n" in item and b":" in item:
+            return item
+    return max(chunks, key=len)
+
+
 class AsyncImapClient:
     """Small compatibility wrapper around aioimaplib."""
 
@@ -95,10 +117,21 @@ class AsyncImapClient:
         uids = await self._search_uids("ALL")
         if not uids:
             return []
-        selected_uids = uids[-max(1, int(batch_size)) :]
 
+        selected_uids = uids[-max(1, int(batch_size)) :]
+        uid_set = self._build_uid_set(selected_uids)
+        bulk_emails = await self._fetch_emails_by_uid_set(uid_set, selected_uids)
+        bulk_map = {uid: raw for uid, raw in bulk_emails}
+
+        if len(bulk_map) == len(selected_uids):
+            return [(uid, bulk_map[uid]) for uid in selected_uids]
+
+        # Fallback: fill missing UIDs one by one.
         emails: list[tuple[str, bytes]] = []
         for uid in selected_uids:
+            if uid in bulk_map:
+                emails.append((uid, bulk_map[uid]))
+                continue
             raw = await self._fetch_email_by_uid(uid)
             if raw:
                 emails.append((uid, raw))
@@ -139,6 +172,51 @@ class AsyncImapClient:
                     return uids
 
         raise ImapClientError("Unable to search IMAP UIDs with current aioimaplib API")
+
+    async def _fetch_emails_by_uid_set(
+        self,
+        uid_set: str,
+        selected_uids: list[str],
+    ) -> list[tuple[str, bytes]]:
+        methods = []
+        if hasattr(self._client, "uid_fetch"):
+            methods.append(
+                (
+                    self._client.uid_fetch,
+                    [
+                        (uid_set, "(RFC822)"),
+                        (uid_set, "RFC822"),
+                        (uid_set, "BODY.PEEK[]"),
+                    ],
+                ),
+            )
+        if hasattr(self._client, "uid"):
+            methods.append(
+                (
+                    self._client.uid,
+                    [
+                        ("FETCH", uid_set, "(RFC822)"),
+                        ("FETCH", uid_set, "RFC822"),
+                        ("FETCH", uid_set, "BODY.PEEK[]"),
+                    ],
+                ),
+            )
+
+        for method, call_args in methods:
+            for args in call_args:
+                try:
+                    status, lines = self._normalize_response(await method(*args))
+                except TypeError:
+                    continue
+                if not self._is_ok(status):
+                    continue
+                raw_map = self._extract_raw_emails(lines)
+                if not raw_map:
+                    continue
+                return [
+                    (uid, raw_map[uid]) for uid in selected_uids if uid in raw_map
+                ]
+        return []
 
     async def _fetch_email_by_uid(self, uid: str) -> bytes:
         methods = []
@@ -182,6 +260,37 @@ class AsyncImapClient:
         raise ImapClientError(f"Unable to fetch email content by UID {uid}")
 
     @staticmethod
+    def _build_uid_set(uids: list[str]) -> str:
+        if not uids:
+            return ""
+
+        numbers = []
+        try:
+            numbers = sorted({int(uid) for uid in uids})
+        except ValueError:
+            return ",".join(uids)
+
+        ranges = []
+        start = numbers[0]
+        end = numbers[0]
+        for value in numbers[1:]:
+            if value == end + 1:
+                end = value
+                continue
+            if start == end:
+                ranges.append(str(start))
+            else:
+                ranges.append(f"{start}:{end}")
+            start = value
+            end = value
+
+        if start == end:
+            ranges.append(str(start))
+        else:
+            ranges.append(f"{start}:{end}")
+        return ",".join(ranges)
+
+    @staticmethod
     def _normalize_response(response) -> tuple[str, list]:
         if response is None:
             return "", []
@@ -214,15 +323,30 @@ class AsyncImapClient:
 
     @staticmethod
     def _parse_uids(lines: list) -> list[str]:
-        text_fragments = []
+        search_numbers: list[str] = []
+        fallback_numbers: list[str] = []
+
         for line in _flatten_lines(lines):
+            text = ""
             if isinstance(line, (bytes, bytearray)):
-                text_fragments.append(line.decode("utf-8", errors="ignore"))
+                text = line.decode("utf-8", errors="ignore")
             elif isinstance(line, str):
-                text_fragments.append(line)
-        text = " ".join(text_fragments)
-        numbers = re.findall(r"\b\d+\b", text)
-        # keep order, remove duplicates
+                text = line
+            else:
+                continue
+
+            upper = text.upper()
+            if "SEARCH" in upper:
+                search_index = upper.find("SEARCH")
+                tail = text[search_index + len("SEARCH") :]
+                search_numbers.extend(re.findall(r"\b\d+\b", tail))
+                continue
+
+            # Fallback only for plain-number lines to avoid pulling unrelated digits.
+            if re.fullmatch(r"\s*\d+(?:\s+\d+)*\s*", text):
+                fallback_numbers.extend(re.findall(r"\b\d+\b", text))
+
+        numbers = search_numbers if search_numbers else fallback_numbers
         seen = set()
         ordered: list[str] = []
         for item in numbers:
@@ -231,6 +355,49 @@ class AsyncImapClient:
             seen.add(item)
             ordered.append(item)
         return ordered
+
+    @staticmethod
+    def _extract_raw_emails(lines: list) -> dict[str, bytes]:
+        records: dict[str, bytes] = {}
+        current_uid: str | None = None
+        current_chunks: list[bytes] = []
+
+        def flush_current() -> None:
+            nonlocal current_uid, current_chunks
+            if not current_uid:
+                current_chunks = []
+                return
+            best = _pick_best_email_chunk(current_chunks)
+            if best:
+                records[current_uid] = best
+            current_uid = None
+            current_chunks = []
+
+        for line in _flatten_lines(lines):
+            text = ""
+            raw_bytes: bytes | None = None
+
+            if isinstance(line, (bytes, bytearray)):
+                raw_bytes = bytes(line)
+                text = raw_bytes.decode("utf-8", errors="ignore")
+            elif isinstance(line, str):
+                text = line
+
+            uid_marker = _extract_uid_marker_from_text(text)
+            if uid_marker:
+                flush_current()
+                current_uid = uid_marker
+                continue
+
+            if current_uid is None:
+                continue
+            if raw_bytes is not None:
+                current_chunks.append(raw_bytes)
+            elif isinstance(line, str) and ("\r\n\r\n" in line and ":" in line):
+                current_chunks.append(line.encode("utf-8", errors="ignore"))
+
+        flush_current()
+        return records
 
     @staticmethod
     def _extract_raw_email(lines: list) -> bytes | None:
